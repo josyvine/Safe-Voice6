@@ -19,8 +19,6 @@ import androidx.camera.core.Preview;
 import androidx.camera.lifecycle.ProcessCameraProvider;
 import androidx.core.content.ContextCompat;
 
-import com.google.android.gms.tasks.OnFailureListener;
-import com.google.android.gms.tasks.OnSuccessListener;
 import com.google.android.gms.tasks.Task;
 import com.google.android.gms.tasks.Tasks;
 import com.google.common.util.concurrent.ListenableFuture;
@@ -46,6 +44,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Activity for performing on-device KYC (Know Your Customer) verification.
@@ -57,7 +56,6 @@ public class KycActivity extends AppCompatActivity {
     private static final String TAG = "KycActivity";
     private static final double FACE_MATCH_THRESHOLD = 0.8; // Similarity threshold for a match
 
-    // Enum for managing the state of the KYC process
     private enum KycState {
         SCANNING_ID,
         SCANNING_FACE,
@@ -69,16 +67,15 @@ public class KycActivity extends AppCompatActivity {
     private ListenableFuture<ProcessCameraProvider> cameraProviderFuture;
     private ExecutorService analysisExecutor;
     private FaceVerifier faceVerifier;
-
-    // --- CHANGE START ---
-    // Store the camera provider as a member variable to avoid re-initializing it.
     private ProcessCameraProvider cameraProvider;
-    // --- CHANGE END ---
 
-    // State management variables
-    private KycState currentState = KycState.SCANNING_ID;
+    private volatile KycState currentState = KycState.SCANNING_ID;
     private float[] idCardEmbedding = null;
     private String verifiedName = null;
+    
+    // --- FIX START: Use a thread-safe boolean to prevent race conditions ---
+    private final AtomicBoolean isProcessing = new AtomicBoolean(false);
+    // --- FIX END ---
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -105,28 +102,21 @@ public class KycActivity extends AppCompatActivity {
         cameraProviderFuture = ProcessCameraProvider.getInstance(this);
         cameraProviderFuture.addListener(() -> {
             try {
-                // --- CHANGE START ---
-                // Get the camera provider instance and store it in our member variable.
                 this.cameraProvider = cameraProviderFuture.get();
-                // Bind the use cases for the first time (for the back camera).
                 bindCameraUseCases();
-                // --- CHANGE END ---
             } catch (Exception e) {
                 Log.e(TAG, "Failed to start camera.", e);
             }
         }, ContextCompat.getMainExecutor(this));
     }
 
-    // --- CHANGE: Method signature no longer needs to accept the provider ---
     private void bindCameraUseCases() {
         if (cameraProvider == null) {
-            Log.e(TAG, "Camera provider not available.");
+            Log.e(TAG, "Camera provider is not available to bind use cases.");
             return;
         }
 
         Preview preview = new Preview.Builder().build();
-        preview.setSurfaceProvider(binding.cameraPreview.getSurfaceProvider());
-
         CameraSelector cameraSelector = (currentState == KycState.SCANNING_ID) ?
                 CameraSelector.DEFAULT_BACK_CAMERA : CameraSelector.DEFAULT_FRONT_CAMERA;
 
@@ -137,15 +127,23 @@ public class KycActivity extends AppCompatActivity {
         imageAnalysis.setAnalyzer(analysisExecutor, new KycImageAnalyzer());
 
         try {
-            // Unbind everything before rebinding
             cameraProvider.unbindAll();
-            // Bind the new camera selector and use cases
             cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageAnalysis);
-            Log.d(TAG, "Camera use cases bound successfully.");
+            Log.i(TAG, "Successfully bound camera for state: " + currentState);
         } catch (Exception e) {
             Log.e(TAG, "Use case binding failed", e);
         }
+        
+        preview.setSurfaceProvider(binding.cameraPreview.getSurfaceProvider());
     }
+
+    // --- FIX START: Create a dedicated method to handle the state transition cleanly ---
+    private void proceedToFaceScan() {
+        Log.d(TAG, "Proceeding to face scan.");
+        currentState = KycState.SCANNING_FACE;
+        updateUIForState();
+    }
+    // --- FIX END ---
 
     private void updateUIForState() {
         runOnUiThread(() -> {
@@ -155,11 +153,8 @@ public class KycActivity extends AppCompatActivity {
                     break;
                 case SCANNING_FACE:
                     binding.textInstructions.setText(R.string.kyc_instructions_face);
-                    // --- CHANGE START ---
-                    // Instead of calling startCamera() again, we directly re-bind the use cases.
-                    // This is a much more stable way to switch the camera.
+                    // This call will now safely rebind the camera to the front lens.
                     bindCameraUseCases();
-                    // --- CHANGE END ---
                     break;
                 case VERIFYING:
                     binding.textInstructions.setText(R.string.kyc_status_verifying);
@@ -186,26 +181,26 @@ public class KycActivity extends AppCompatActivity {
         @Override
         @SuppressLint("UnsafeOptInUsageError")
         public void analyze(@NonNull ImageProxy imageProxy) {
+            if (currentState != KycState.SCANNING_ID && currentState != KycState.SCANNING_FACE) {
+                imageProxy.close();
+                return;
+            }
+            
             Image mediaImage = imageProxy.getImage();
-            if (mediaImage == null || currentState == KycState.VERIFYING || currentState == KycState.COMPLETE) {
+            if (mediaImage == null) {
                 imageProxy.close();
                 return;
             }
 
             InputImage image = InputImage.fromMediaImage(mediaImage, imageProxy.getImageInfo().getRotationDegrees());
 
-            Task<?> processingTask;
-
             if (currentState == KycState.SCANNING_ID) {
-                processingTask = processIdCardImage(image, imageProxy);
+                processIdCardImage(image, imageProxy).addOnCompleteListener(task -> imageProxy.close());
             } else if (currentState == KycState.SCANNING_FACE) {
-                processingTask = processLiveFaceImage(image, imageProxy);
+                processLiveFaceImage(image, imageProxy).addOnCompleteListener(task -> imageProxy.close());
             } else {
                 imageProxy.close();
-                return;
             }
-
-            processingTask.addOnCompleteListener(task -> imageProxy.close());
         }
 
         private Task<Void> processIdCardImage(InputImage image, ImageProxy imageProxy) {
@@ -218,29 +213,26 @@ public class KycActivity extends AppCompatActivity {
                         Text visionText = textRecognitionTask.getResult();
                         if (visionText != null) {
                             String name = extractNameFromText(visionText);
-                            if (name != null) {
-                                Log.i(TAG, "Successfully extracted name: " + name);
-                                verifiedName = name;
-                            }
+                            if (name != null) verifiedName = name;
                         }
                     }
 
                     if (idCardEmbedding == null) {
                         List<Face> faces = faceDetectionTask.getResult();
                         if (faces != null && !faces.isEmpty()) {
-                            Face idFace = faces.get(0);
-                            Bitmap croppedFace = ImageUtils.cropAndConvert(imageProxy, idFace.getBoundingBox());
-                            if (croppedFace != null) {
-                                idCardEmbedding = faceVerifier.getFaceEmbedding(croppedFace);
-                                Log.i(TAG, "Successfully generated ID card embedding.");
-                            }
+                            Bitmap croppedFace = ImageUtils.cropAndConvert(imageProxy, faces.get(0).getBoundingBox());
+                            if (croppedFace != null) idCardEmbedding = faceVerifier.getFaceEmbedding(croppedFace);
                         }
                     }
 
                     if (verifiedName != null && idCardEmbedding != null) {
-                        Log.i(TAG, "ID Scan Complete! Proceeding to face scan.");
-                        currentState = KycState.SCANNING_FACE;
-                        updateUIForState();
+                        // --- FIX START: Safely trigger the state change ---
+                        // Use compareAndSet to ensure this block runs only ONCE.
+                        if (isProcessing.compareAndSet(false, true)) {
+                            // Post the action to the main thread and let it handle the camera logic.
+                            runOnUiThread(() -> proceedToFaceScan());
+                        }
+                        // --- FIX END ---
                     }
                 });
         }
@@ -248,16 +240,13 @@ public class KycActivity extends AppCompatActivity {
         private Task<List<Face>> processLiveFaceImage(InputImage image, ImageProxy imageProxy) {
             return faceDetector.process(image)
                 .addOnSuccessListener(faces -> {
-                    if (!faces.isEmpty()) {
+                    if (!faces.isEmpty() && isProcessing.compareAndSet(true, false)) {
                         currentState = KycState.VERIFYING;
                         updateUIForState();
 
-                        Face liveFace = faces.get(0);
-                        Bitmap croppedFace = ImageUtils.cropAndConvert(imageProxy, liveFace.getBoundingBox());
+                        Bitmap croppedFace = ImageUtils.cropAndConvert(imageProxy, faces.get(0).getBoundingBox());
                         if (croppedFace != null) {
                             float[] liveEmbedding = faceVerifier.getFaceEmbedding(croppedFace);
-                            Log.d(TAG, "Live face embedding generated.");
-
                             double similarity = faceVerifier.calculateSimilarity(idCardEmbedding, liveEmbedding);
                             Log.i(TAG, "Face similarity score: " + similarity);
 
@@ -266,9 +255,6 @@ public class KycActivity extends AppCompatActivity {
                             } else {
                                 handleVerificationFailure("Face does not match ID.");
                             }
-                        } else {
-                            currentState = KycState.SCANNING_FACE;
-                            updateUIForState();
                         }
                     }
                 });
@@ -282,21 +268,12 @@ public class KycActivity extends AppCompatActivity {
                 String lineText = line.getText();
                 if (lineText.matches("([A-Z][a-zA-Z]*[.]?[ ]?){2,3}")) {
                     if (!lineText.matches(".*[0-9].*") && lineText.length() < 30) {
-                        Log.d(TAG, "Potential name found: " + lineText);
                         return lineText;
                     }
                 }
             }
         }
         return null;
-    }
-
-    private Bitmap cropBitmapToFace(Bitmap source, Rect boundingBox) {
-        int x = Math.max(0, boundingBox.left);
-        int y = Math.max(0, boundingBox.top);
-        int width = Math.min(source.getWidth() - x, boundingBox.width());
-        int height = Math.min(source.getHeight() - y, boundingBox.height());
-        return Bitmap.createBitmap(source, x, y, width, height);
     }
 
     private void handleVerificationSuccess() {
@@ -307,19 +284,20 @@ public class KycActivity extends AppCompatActivity {
         FirebaseUser user = FirebaseAuth.getInstance().getCurrentUser();
         if (user != null) {
             Map<String, Object> userData = new HashMap<>();
+            userData.put("isVerified", true);
             userData.put("verifiedName", verifiedName);
             FirebaseFirestore.getInstance().collection("users").document(user.getUid())
-                    .set(userData)
+                    .update(userData)
                     .addOnSuccessListener(aVoid -> {
                         Toast.makeText(KycActivity.this, "Verification successful!", Toast.LENGTH_LONG).show();
                         finish();
                     })
                     .addOnFailureListener(e -> {
-                         Toast.makeText(KycActivity.this, "Verification successful, but failed to save name.", Toast.LENGTH_LONG).show();
+                         Toast.makeText(KycActivity.this, "Verification successful, but failed to save.", Toast.LENGTH_LONG).show();
                          finish();
                      });
         } else {
-             Toast.makeText(this, "Verification successful, but no signed-in user found.", Toast.LENGTH_LONG).show();
+             Toast.makeText(this, "Verification successful, but no user found.", Toast.LENGTH_LONG).show();
              finish();
         }
     }
@@ -329,17 +307,14 @@ public class KycActivity extends AppCompatActivity {
         currentState = KycState.COMPLETE;
         updateUIForState();
         Toast.makeText(this, "Verification Failed: " + reason, Toast.LENGTH_LONG).show();
-        
         new android.os.Handler(Looper.getMainLooper()).postDelayed(this::finish, 3000);
     }
-
-
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        if (cameraProviderFuture != null) {
-            cameraProviderFuture.cancel(true);
+        if (cameraProvider != null) {
+            cameraProvider.unbindAll();
         }
         if (analysisExecutor != null) {
             analysisExecutor.shutdown();
