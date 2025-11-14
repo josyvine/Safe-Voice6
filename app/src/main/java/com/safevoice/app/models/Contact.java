@@ -6,7 +6,7 @@ import androidx.annotation.Nullable;
 import org.json.JSONException;
 import org.json.JSONObject;
 
-import java.util.Objects;
+import java.util.Objects; 
 
 /**
  * A simple data model class (POJO) to represent an emergency contact.
