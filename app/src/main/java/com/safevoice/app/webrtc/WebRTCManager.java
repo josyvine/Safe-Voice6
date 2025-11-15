@@ -52,6 +52,12 @@ public class WebRTCManager implements FirebaseSignalingClient.SignalingListener 
         initializePeerConnectionFactory();
     }
 
+    // --- THIS IS THE FIX ---
+    // This public method allows other classes like EmergencyHandlerService to get the session ID.
+    public FirebaseSignalingClient getSignalingClient() {
+        return this.signalingClient;
+    }
+
     private void initializePeerConnectionFactory() {
         PeerConnectionFactory.InitializationOptions initializationOptions = PeerConnectionFactory.InitializationOptions.builder(context)
                 .createInitializationOptions();
@@ -293,4 +299,4 @@ public class WebRTCManager implements FirebaseSignalingClient.SignalingListener 
         }
         PeerConnectionFactory.shutdownInternalTracer();
     }
-                  }
+}
